@@ -11,12 +11,14 @@ Some code here have been copied from https://github.com/onnx/sklearn-onnx/.
 from collections import OrderedDict
 from copy import deepcopy
 import pprint
+import json
 from uuid import uuid4
 
 import numpy as np
 from onnxconverter_common.container import CommonSklearnModelContainer
 from onnxconverter_common.optimizer import LinkedNode, _topological_sort
 from onnxconverter_common.topology import Topology
+from onnxconverter_common.data_types import FloatTensorType, DoubleTensorType, Int32TensorType, Int64TensorType
 from sklearn import pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
@@ -297,6 +299,149 @@ def _parse_sparkml_pipeline(scope, model, all_outputs):
     return current_op_outputs, all_outputs
 
 
+def _parse_sparkml_sqltransformer(scope, operator, all_inputs):
+    """
+    Parses SparkML SQLTransformer operator which takes a slightly different approach compared to the other SparkML operators.
+    :param scope: Scope object
+    :param model: A *scikit-learn* *ColumnTransformer* object
+    :param all_inputs: A list of Variable objects
+    :return: A list of output variables produced by column transformer
+    """
+    if isinstance(operator, str):
+        raise RuntimeError("Parameter operator must be an object not a " "string '{0}'.".format(operator))
+
+    import pyspark
+    import pandas as pd
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.builder.getOrCreate()
+    parser = spark._jsparkSession.sessionState().sqlParser()
+    plan = parser.parsePlan(operator.getStatement())
+    plan_json = json.loads(plan.toJSON())
+
+    def _get_sample_input(onnx_input):
+        onnx_type = onnx_input.type
+        if type(onnx_type) == DoubleTensorType:
+            np_type = np.float64
+        elif type(onnx_type) == FloatTensorType:
+            np_type = np.float32
+        elif type(onnx_type) == Int32TensorType:
+            np_type = np.int32
+        elif type(onnx_type) == Int64TensorType:
+            np_type = np.int64
+        else:
+            raise RuntimeError('Unsupport ONNX datatype {} encounted in SQLTransformer.'.format(onnx_type))
+
+        shape = onnx_type.shape
+        # If the second dimension is 1, we treat the column as a vector.
+        if len(shape) == 2 and shape[1] == 1:
+            shape = shape[:1]
+
+        return np.zeros(shape=shape, dtype=np_type).tolist()
+
+    # We create a sample input data frame to obtain the Catalyst optimized paln.
+    df = spark.createDataFrame(pd.DataFrame({i.raw_name: _get_sample_input(i) for i in all_inputs if not i.is_abandoned}))
+    catalyst_plan = operator.transform(df)._jdf.logicalPlan()
+    optimized_plan = spark\
+        ._jsparkSession\
+        .sessionState()\
+        .executePlan(catalyst_plan)\
+        .optimizedPlan()
+    plan_json = json.loads(optimized_plan.toJSON())
+
+    sql_transformer_outputs = []
+
+    # WHERE clause
+    filter_tree = [node for node in plan_json if node['class'] == 'org.apache.spark.sql.catalyst.plans.logical.Filter']
+    if len(filter_tree) > 0:
+        conditions = filter_tree[0]['condition']
+        where_operator = scope.declare_local_operator("SparkMLSQLWhereModel", conditions)
+        where_operator.inputs = all_inputs
+        for input in all_inputs:
+            if not input.is_abandoned:
+                output = scope.declare_local_variable(input.raw_name)
+                input.is_abandoned = True
+                where_operator.outputs.append(output)
+        all_inputs = where_operator.outputs
+
+    groupby_clause = [[node['groupingExpressions'], node['aggregateExpressions']] for node in plan_json if node['class'] == 'org.apache.spark.sql.catalyst.plans.logical.Aggregate']
+
+    if len(groupby_clause) > 0:
+        # GROUP BY + SELECT clause
+        groupby_nodes, project_trees = groupby_clause[0]
+        groupby_col_names = [n[0]['name'] for n in groupby_nodes if n[0]['class'] == 'org.apache.spark.sql.catalyst.expressions.AttributeReference']
+        assert(len(groupby_col_names) == len(groupby_nodes))
+
+        project_trees = [p for p in project_trees if p[0]['class'] in ['org.apache.spark.sql.catalyst.expressions.Alias', 'org.apache.spark.sql.catalyst.expressions.AttributeReference']]
+
+        output_names = []
+        input_names = [c for c in groupby_col_names]
+        for project_tree in project_trees:
+            output_name = project_tree[0]['name']
+            output_names.append(output_name)
+            for project_tree_node in project_tree[1:]:
+                if project_tree_node['class'] == 'org.apache.spark.sql.catalyst.expressions.AttributeReference':
+                    name = project_tree_node['name']
+                    if name not in input_names:
+                        input_names.append(name)
+
+        groupby_mapping_operator = scope.declare_local_operator("SparkMLSQLGroupByMappingModel", (groupby_col_names, project_trees))
+        temp = {i.raw_name: i for i in all_inputs if i.raw_name in input_names and not i.is_abandoned}
+        groupby_mapping_operator.inputs = [temp[i] for i in input_names]
+        for o in output_names:
+            output = scope.declare_local_variable(o)
+            groupby_mapping_operator.outputs.append(output)
+            sql_transformer_outputs.append(output)
+
+        for input in all_inputs:
+            if not input.is_abandoned:
+                input.is_abandoned = True
+        all_inputs = []
+
+    else:
+        # Pure SELECT clause
+        project_trees = [node['projectList'] for node in plan_json if node['class'] == 'org.apache.spark.sql.catalyst.plans.logical.Project']
+        if len(project_trees) > 0:
+            project_trees = [p for p in project_trees[0] if p[0]['class'] == 'org.apache.spark.sql.catalyst.expressions.Alias']
+
+            for project_tree in project_trees:
+                output_name = project_tree[0]['name']
+                input_names = []
+                for project_tree_node in project_tree[1:]:
+                    if project_tree_node['class'] == 'org.apache.spark.sql.catalyst.expressions.AttributeReference':
+                        name = project_tree_node['name']
+                        if name not in input_names:
+                            input_names.append(name)
+
+                select_operator = scope.declare_local_operator("SparkMLSQLSelectModel", project_tree)
+                temp = {i.raw_name: i for i in all_inputs if i.raw_name in input_names and not i.is_abandoned}
+                select_operator.inputs = [temp[i] for i in input_names]
+                output = scope.declare_local_variable(output_name)
+                select_operator.outputs.append(output)
+                sql_transformer_outputs.append(output)
+
+    # ORDER BY clause
+    sort_order_trees = [node['order'] for node in plan_json if node['class'] == 'org.apache.spark.sql.catalyst.plans.logical.Sort']
+    if len(sort_order_trees) > 0:
+        order_trees = sort_order_trees[0]
+        orderby_operator = scope.declare_local_operator("SparkMLSQLOrderByModel", order_trees)
+        orderby_operator.inputs = all_inputs + sql_transformer_outputs
+        for input in all_inputs:
+            if not input.is_abandoned:
+                output = scope.declare_local_variable(input.raw_name)
+                input.is_abandoned = True
+                orderby_operator.outputs.append(output)
+        all_inputs = orderby_operator.outputs
+
+        for input in sql_transformer_outputs:
+            if not input.is_abandoned:
+                output = scope.declare_local_variable(input.raw_name)
+                input.is_abandoned = True
+                orderby_operator.outputs.append(output)
+
+    return sql_transformer_outputs, all_inputs + sql_transformer_outputs
+
+
 def _parse_sklearn_feature_union(scope, model, inputs):
     """
     Taken from https://github.com/onnx/sklearn-onnx/blob/9939c089a467676f4ffe9f3cb91098c4841f89d8/skl2onnx/_parse.py#L199.
@@ -430,9 +575,11 @@ def _build_sklearn_api_parsers_map():
 def _build_sparkml_api_parsers_map():
     # Parsers for edge cases are going here.
     from pyspark.ml.pipeline import PipelineModel
+    from pyspark.ml.feature import SQLTransformer
 
     map_parser = {
         PipelineModel: _parse_sparkml_pipeline,
+        SQLTransformer: _parse_sparkml_sqltransformer
         # More parsers will go here
     }
 
@@ -498,23 +645,23 @@ def _parse_onnx_single_operator(scope, operator):
         this_operator.outputs.append(variable)
 
 
-def _parse_sparkml_api(scope, model, inputs):
+def _parse_sparkml_api(scope, model, all_inputs):
     """
     This function handles all input Spark-ML models.
 
     Args:
         scope: The ``onnxconverter_common.topology.Scope`` where the model will be added
         model: A Spark-ML model object
-        inputs: A list of `onnxconverter_common.topology.Variable`s
+        all_inputs: A list of `onnxconverter_common.topology.Variable`s
 
     Returns:
         A list of output `onnxconverter_common.topology.Variable` which will be passed to next stage
     """
     tmodel = type(model)
     if tmodel in sparkml_api_parsers_map:
-        outputs = sparkml_api_parsers_map[tmodel](scope, model, inputs)
+        outputs = sparkml_api_parsers_map[tmodel](scope, model, all_inputs)
     else:
-        outputs = _parse_sparkml_single_operator(scope, model, inputs)
+        outputs = _parse_sparkml_single_operator(scope, model, all_inputs)
     return outputs
 
 
@@ -536,15 +683,14 @@ def _parse_sparkml_single_operator(scope, operator, all_inputs):
     this_operator = scope.declare_local_operator(alias, operator)
 
     if hasattr(operator, "getInputCol") and callable(operator.getInputCol):
-        this_operator.inputs = [i for i in all_inputs if i.raw_name == operator.getInputCol()]
+        this_operator.inputs = [i for i in all_inputs if i.raw_name == operator.getInputCol() and not i.is_abandoned]
     elif hasattr(operator, "getInputCols") and callable(operator.getInputCols):
-        temp = {i.raw_name: i for i in all_inputs if i.raw_name in operator.getInputCols()}
+        temp = {i.raw_name: i for i in all_inputs if i.raw_name in operator.getInputCols() and not i.is_abandoned}
         this_operator.inputs = [temp[i] for i in operator.getInputCols()]
     elif operator.hasParam("featuresCol"):
         col_name = [param[1] for param in operator.extractParamMap().items() if param[0].name == "featuresCol"][0]
-        this_operator.inputs = [i for i in all_inputs if i.raw_name == col_name]
+        this_operator.inputs = [i for i in all_inputs if i.raw_name == col_name and not i.is_abandoned]
     else:
-        print(operator.getParam("featuresCol"))
         raise RuntimeError("Unable to determine inputs for the Spark-ML operator: {}".format(type(operator)))
 
     if hasattr(operator, "getOutputCol") and callable(operator.getOutputCol):
